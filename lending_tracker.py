@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import date
 import psycopg2
+import sqlite3
+import os
 
 # ==========================================
 # DATABASE INITIALIZATION
@@ -47,6 +49,61 @@ def fetch_data(query, params=()):
     conn.close()
     return df
 
+def migrate_local_to_cloud():
+    local_db = "lending_firm_v2.db" if os.path.exists("lending_firm_v2.db") else "lending_firm.db"
+    
+    if not os.path.exists(local_db):
+        st.error(f"❌ Could not find '{local_db}' in the application folder.")
+        return
+
+    try:
+        sl_conn = sqlite3.connect(local_db)
+        sl_cur = sl_conn.cursor()
+        
+        pg_conn = get_connection()
+        pg_cur = pg_conn.cursor()
+        
+        # Migrate Loans
+        sl_cur.execute("PRAGMA table_info(loans)")
+        columns = [info[1] for info in sl_cur.fetchall()]
+        
+        if "remaining_principal" in columns:
+            sl_cur.execute("SELECT id, customer_name, original_principal, remaining_principal, monthly_roi, start_date, status FROM loans")
+        else:
+            sl_cur.execute("SELECT id, customer_name, principal_amount, principal_amount, monthly_roi, start_date, status FROM loans")
+            
+        loans = sl_cur.fetchall()
+        for loan in loans:
+            pg_cur.execute(
+                """INSERT INTO loans (id, customer_name, original_principal, remaining_principal, monthly_roi, start_date, status) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
+                loan
+            )
+            
+        pg_cur.execute("SELECT setval(pg_get_serial_sequence('loans', 'id'), coalesce(max(id),0) + 1, false) FROM loans;")
+
+        # Migrate Payments
+        sl_cur.execute("SELECT id, loan_id, payment_date, amount, payment_type FROM payments")
+        payments = sl_cur.fetchall()
+        
+        for payment in payments:
+            pg_cur.execute(
+                """INSERT INTO payments (id, loan_id, payment_date, amount, payment_type) 
+                   VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
+                payment
+            )
+            
+        pg_cur.execute("SELECT setval(pg_get_serial_sequence('payments', 'id'), coalesce(max(id),0) + 1, false) FROM payments;")
+        
+        pg_conn.commit()
+        st.success("✅ Successfully migrated all local data to Supabase Cloud! Refresh the active loans tab to see your records.")
+        
+    except Exception as e:
+        st.error(f"❌ An error occurred: {e}")
+    finally:
+        if 'sl_conn' in locals(): sl_conn.close()
+        if 'pg_conn' in locals(): pg_conn.close()
+
 # ==========================================
 # STREAMLIT UI APP & AUTHENTICATION
 # ==========================================
@@ -75,9 +132,14 @@ if not st.session_state.authenticated:
 # ==========================================
 init_db()
 
-st.title("🏢 SP Enterprise | Lending Management Dashboard")
+# Adds a persistent disclaimer to the left sidebar
+with st.sidebar:
+    st.warning("⚠️ **Disclaimer**\n\nThis application is for **educational purposes** only and serves as a **demo**. It is not intended for processing real financial transactions.")
 
-tab1, tab2, tab3 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment"])
+st.title("🏢 SP Enterprise | Lending Management Dashboard")
+st.caption("*(Educational Demo Version)*")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment", "🛠️ Admin System"])
 
 with tab1:
     st.subheader("Current Active Loans")
@@ -172,3 +234,11 @@ with tab3:
             st.dataframe(history, use_container_width=True, hide_index=True)
     else:
         st.info("No active loans available to receive payments.")
+
+with tab4:
+    st.subheader("System Administration")
+    st.info("Use this tool to migrate existing records from your local SQLite database to the Supabase Cloud. This only needs to be done once.")
+    
+    if st.button("Migrate Local Data to Cloud", type="primary"):
+        with st.spinner("Migrating data to Supabase..."):
+            migrate_local_to_cloud()

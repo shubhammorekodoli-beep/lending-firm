@@ -4,6 +4,10 @@ from datetime import date
 import psycopg2
 import sqlite3
 import os
+import smtplib
+from email.message import EmailMessage
+from fpdf import FPDF
+import tempfile
 
 # ==========================================
 # DATABASE INITIALIZATION
@@ -50,11 +54,9 @@ def fetch_data(query, params=()):
 
 def migrate_local_to_cloud():
     local_db = "lending_firm_v2.db" if os.path.exists("lending_firm_v2.db") else "lending_firm.db"
-    
     if not os.path.exists(local_db):
         st.error(f"❌ Could not find '{local_db}' in the application folder.")
         return
-
     try:
         sl_conn = sqlite3.connect(local_db)
         sl_cur = sl_conn.cursor()
@@ -76,28 +78,87 @@ def migrate_local_to_cloud():
                    VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
                 loan
             )
-            
         pg_cur.execute("SELECT setval(pg_get_serial_sequence('loans', 'id'), coalesce(max(id),0) + 1, false) FROM loans;")
 
         sl_cur.execute("SELECT id, loan_id, payment_date, amount, payment_type FROM payments")
         payments = sl_cur.fetchall()
-        
         for payment in payments:
             pg_cur.execute(
                 """INSERT INTO payments (id, loan_id, payment_date, amount, payment_type) 
                    VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
                 payment
             )
-            
         pg_cur.execute("SELECT setval(pg_get_serial_sequence('payments', 'id'), coalesce(max(id),0) + 1, false) FROM payments;")
         pg_conn.commit()
         st.success("✅ Successfully migrated all local data to Supabase Cloud!")
-        
     except Exception as e:
         st.error(f"❌ An error occurred: {e}")
     finally:
         if 'sl_conn' in locals(): sl_conn.close()
         if 'pg_conn' in locals(): pg_conn.close()
+
+# ==========================================
+# REPORT GENERATION & EMAIL LOGIC
+# ==========================================
+def calc_next_emi(start_dt):
+    next_date = pd.to_datetime(start_dt)
+    while next_date.date() <= date.today():
+        next_date += pd.DateOffset(months=1)
+    return next_date.date()
+
+def generate_pdf(df):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("helvetica", size=16, style="B")
+    pdf.cell(0, 10, "SP Enterprise - Pending & Upcoming EMIs", ln=True, align='C')
+    pdf.ln(5)
+    
+    pdf.set_font("helvetica", size=10)
+    pdf.cell(0, 10, f"Generated on: {date.today()}", ln=True, align='R')
+    pdf.ln(5)
+    
+    if df.empty:
+        pdf.cell(0, 10, "No pending EMIs found.", ln=True)
+    else:
+        for index, row in df.iterrows():
+            # Formatting each loan as a text block for clean mobile viewing
+            pdf.set_font("helvetica", size=11, style="B")
+            pdf.cell(0, 8, f"Customer: {row['customer_name']}", ln=True)
+            
+            pdf.set_font("helvetica", size=10)
+            pdf.cell(0, 6, f"   Remaining Principal: Rs {row['remaining_principal']:,.2f}", ln=True)
+            pdf.cell(0, 6, f"   Next EMI Date: {row['Next EMI Date']} | Amount Due: Rs {row['Current EMI']:,.2f}", ln=True)
+            pdf.ln(4)
+            
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf.output(tmp_file.name)
+    return tmp_file.name
+
+def email_report(pdf_path):
+    try:
+        sender_email = st.secrets["EMAIL_SENDER"]
+        sender_pwd = st.secrets["EMAIL_PASSWORD"]
+        receiver_email = "santosh.padwal1@gmail.com"
+        
+        msg = EmailMessage()
+        msg['Subject'] = f"SP Enterprise: Pending EMIs Report - {date.today()}"
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+        msg.set_content("Hello,\n\nPlease find the attached PDF report detailing the pending and upcoming EMIs for active loans.\n\nBest,\nSP Enterprise System")
+        
+        with open(pdf_path, 'rb') as f:
+            pdf_data = f.read()
+            
+        msg.add_attachment(pdf_data, maintype='application', subtype='pdf', filename=f'EMI_Report_{date.today()}.pdf')
+        
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(sender_email, sender_pwd)
+            server.send_message(msg)
+            
+        return True
+    except Exception as e:
+        st.error(f"Email failed to send. Error: {e}")
+        return False
 
 # ==========================================
 # STREAMLIT UI APP & AUTHENTICATION
@@ -106,17 +167,31 @@ st.set_page_config(page_title="SP Enterprise - Lending System", page_icon="🏢"
 
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
+    st.session_state.current_user = None
 
-def check_pin():
-    if st.session_state.pin_input == "223568":
+VALID_USERS = {
+    "shubham.more": "shubham.18",
+    "santosh.padwal": "santosh.11"
+}
+
+def authenticate():
+    user = st.session_state.username_input
+    pwd = st.session_state.password_input
+    if user in VALID_USERS and VALID_USERS[user] == pwd:
         st.session_state.authenticated = True
+        st.session_state.current_user = user
     else:
-        st.error("Incorrect PIN. Access Denied.")
+        st.error("Invalid Username or Password. Access Denied.")
 
 if not st.session_state.authenticated:
     st.title("🏢 SP Enterprise")
     st.subheader("Secure Lending Management System")
-    st.text_input("Enter your 6-digit PIN to access the dashboard", type="password", key="pin_input", on_change=check_pin)
+    
+    with st.form("login_form"):
+        st.text_input("Username", key="username_input")
+        st.text_input("Password", type="password", key="password_input")
+        st.form_submit_button("Log In", on_click=authenticate, type="primary")
+        
     st.stop() 
 
 # ==========================================
@@ -124,35 +199,42 @@ if not st.session_state.authenticated:
 # ==========================================
 init_db()
 
-st.title("🏢 SP Enterprise | Lending Management Dashboard")
+col1, col2 = st.columns([0.8, 0.2])
+with col1:
+    st.title("🏢 SP Enterprise | Lending Management")
+with col2:
+    st.write(f"👤 Logged in as: **{st.session_state.current_user}**")
+    if st.button("Log Out"):
+        st.session_state.authenticated = False
+        st.rerun()
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment", "🛠️ Manage & Admin"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment", "🛠️ Manage & Admin", "📧 Email Reports"])
 
 # --- TAB 1: ACTIVE LOANS ---
 with tab1:
     st.subheader("Current Active Loans")
-    active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
+    active_loans = fetch_data("""
+        SELECT l.*, 
+               COALESCE((SELECT SUM(amount) FROM payments p WHERE p.loan_id = l.id AND p.payment_type = 'Interest'), 0) as total_interest_collected 
+        FROM loans l 
+        WHERE l.status = 'Active'
+    """)
     
     if not active_loans.empty:
-        # Calculate Next EMI Date dynamically (Finds the next upcoming month from the start date)
-        def calc_next_emi(start_dt):
-            next_date = pd.to_datetime(start_dt)
-            while next_date.date() <= date.today():
-                next_date += pd.DateOffset(months=1)
-            return next_date.date()
-
         active_loans['Next EMI Date'] = active_loans['start_date'].apply(calc_next_emi)
         active_loans['Current EMI'] = active_loans['remaining_principal'] * (active_loans['monthly_roi'] / 100)
         
         total_remaining = active_loans['remaining_principal'].sum()
         total_monthly_interest = active_loans['Current EMI'].sum()
+        total_historical_interest = active_loans['total_interest_collected'].sum()
         
-        col1, col2 = st.columns(2)
-        col1.metric("Total Outstanding Principal Lent", f"₹ {total_remaining:,.2f}")
-        col2.metric("Expected Monthly Interest Yield", f"₹ {total_monthly_interest:,.2f}")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Outstanding Principal", f"₹ {total_remaining:,.2f}")
+        col2.metric("Expected Monthly Yield", f"₹ {total_monthly_interest:,.2f}")
+        col3.metric("Total Interest Collected", f"₹ {total_historical_interest:,.2f}")
         
-        display_df = active_loans[['id', 'customer_name', 'original_principal', 'remaining_principal', 'monthly_roi', 'Current EMI', 'start_date', 'Next EMI Date']]
-        display_df.columns = ['Loan ID', 'Customer Name', 'Original (₹)', 'Remaining (₹)', 'ROI (%)', 'Next EMI (₹)', 'Start Date', 'Next EMI Date']
+        display_df = active_loans[['id', 'customer_name', 'original_principal', 'remaining_principal', 'total_interest_collected', 'monthly_roi', 'Current EMI', 'Next EMI Date']]
+        display_df.columns = ['Loan ID', 'Customer Name', 'Original (₹)', 'Remaining (₹)', 'Interest Gained (₹)', 'ROI (%)', 'Next EMI (₹)', 'Next EMI Date']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
         st.info("No active loans found.")
@@ -180,10 +262,10 @@ with tab2:
 # --- TAB 3: RECORD PAYMENT ---
 with tab3:
     st.subheader("Log Collections & Principal Returns")
-    active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
+    active_loans_dropdown = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
     
-    if not active_loans.empty:
-        loan_options = active_loans.apply(
+    if not active_loans_dropdown.empty:
+        loan_options = active_loans_dropdown.apply(
             lambda x: f"ID: {x['id']} | {x['customer_name']} | Remaining: ₹{x['remaining_principal']}", axis=1
         ).tolist()
         
@@ -236,17 +318,17 @@ with tab3:
 # --- TAB 4: MANAGE & ADMIN ---
 with tab4:
     st.subheader("Edit or Delete Existing Loans")
-    active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
+    active_loans_manage = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
     
-    if not active_loans.empty:
-        manage_options = active_loans.apply(
+    if not active_loans_manage.empty:
+        manage_options = active_loans_manage.apply(
             lambda x: f"ID: {x['id']} | {x['customer_name']}", axis=1
         ).tolist()
         
         selected_manage_str = st.selectbox("Select Loan to Modify", manage_options, key="manage_select")
         manage_loan_id = int(selected_manage_str.split(" | ")[0].replace("ID: ", ""))
         
-        loan_detail = active_loans[active_loans['id'] == manage_loan_id].iloc[0]
+        loan_detail = active_loans_manage[active_loans_manage['id'] == manage_loan_id].iloc[0]
         
         with st.form("edit_loan_form"):
             st.write("**Edit Loan Details**")
@@ -273,10 +355,38 @@ with tab4:
         
     st.divider()
     st.subheader("System Administration")
-    st.info("Use this tool to migrate existing records from your local SQLite database to the Supabase Cloud. This only needs to be done once.")
     if st.button("Migrate Local Data to Cloud"):
         with st.spinner("Migrating data to Supabase..."):
             migrate_local_to_cloud()
+
+# --- TAB 5: EMAIL REPORTS ---
+with tab5:
+    st.subheader("Send Upcoming EMI Report")
+    st.write("Generate a PDF summary of all active customers and their upcoming EMI payment dates, then email it to **santosh.padwal1@gmail.com**.")
+    
+    if st.button("📧 Generate PDF & Send Email", type="primary"):
+        with st.spinner("Compiling data and securely sending email..."):
+            report_data = fetch_data("SELECT customer_name, remaining_principal, monthly_roi, start_date FROM loans WHERE status = 'Active'")
+            
+            if not report_data.empty:
+                # Add calculated columns for the PDF
+                report_data['Next EMI Date'] = report_data['start_date'].apply(calc_next_emi)
+                report_data['Current EMI'] = report_data['remaining_principal'] * (report_data['monthly_roi'] / 100)
+                
+                # Sort by earliest upcoming EMI date
+                report_data = report_data.sort_values(by='Next EMI Date')
+                
+                pdf_file_path = generate_pdf(report_data)
+                
+                # Verify secrets exist before sending
+                if "EMAIL_SENDER" in st.secrets and "EMAIL_PASSWORD" in st.secrets:
+                    success = email_report(pdf_file_path)
+                    if success:
+                        st.success("✅ PDF Generated and successfully emailed to santosh.padwal1@gmail.com!")
+                else:
+                    st.error("⚠️️ Email configuration missing. Please add EMAIL_SENDER and EMAIL_PASSWORD to your Streamlit Secrets.")
+            else:
+                st.info("No active loans found. Email not sent.")
 
 # ==========================================
 # FOOTER DISCLAIMER

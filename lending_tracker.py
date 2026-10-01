@@ -8,7 +8,6 @@ import os
 # ==========================================
 # DATABASE INITIALIZATION
 # ==========================================
-# Fetches the database URL from Streamlit's secure secrets
 DB_URL = st.secrets["DATABASE_URL"]
 
 def get_connection():
@@ -59,11 +58,9 @@ def migrate_local_to_cloud():
     try:
         sl_conn = sqlite3.connect(local_db)
         sl_cur = sl_conn.cursor()
-        
         pg_conn = get_connection()
         pg_cur = pg_conn.cursor()
         
-        # Migrate Loans
         sl_cur.execute("PRAGMA table_info(loans)")
         columns = [info[1] for info in sl_cur.fetchall()]
         
@@ -82,7 +79,6 @@ def migrate_local_to_cloud():
             
         pg_cur.execute("SELECT setval(pg_get_serial_sequence('loans', 'id'), coalesce(max(id),0) + 1, false) FROM loans;")
 
-        # Migrate Payments
         sl_cur.execute("SELECT id, loan_id, payment_date, amount, payment_type FROM payments")
         payments = sl_cur.fetchall()
         
@@ -94,9 +90,8 @@ def migrate_local_to_cloud():
             )
             
         pg_cur.execute("SELECT setval(pg_get_serial_sequence('payments', 'id'), coalesce(max(id),0) + 1, false) FROM payments;")
-        
         pg_conn.commit()
-        st.success("✅ Successfully migrated all local data to Supabase Cloud! Refresh the active loans tab to see your records.")
+        st.success("✅ Successfully migrated all local data to Supabase Cloud!")
         
     except Exception as e:
         st.error(f"❌ An error occurred: {e}")
@@ -109,43 +104,44 @@ def migrate_local_to_cloud():
 # ==========================================
 st.set_page_config(page_title="SP Enterprise - Lending System", page_icon="🏢", layout="wide")
 
-# 1. Initialize authentication state
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 
-# 2. Function to verify PIN
 def check_pin():
     if st.session_state.pin_input == "223568":
         st.session_state.authenticated = True
     else:
         st.error("Incorrect PIN. Access Denied.")
 
-# 3. Show SP Enterprise PIN screen if not authenticated
 if not st.session_state.authenticated:
     st.title("🏢 SP Enterprise")
     st.subheader("Secure Lending Management System")
     st.text_input("Enter your 6-digit PIN to access the dashboard", type="password", key="pin_input", on_change=check_pin)
-    st.stop()  # Hides the rest of the app until authenticated
+    st.stop() 
 
 # ==========================================
-# MAIN DASHBOARD (Only visible if PIN is correct)
+# MAIN DASHBOARD 
 # ==========================================
 init_db()
 
-# Adds a persistent disclaimer to the left sidebar
-with st.sidebar:
-    st.warning("⚠️ **Disclaimer**\n\nThis application is for **educational purposes** only and serves as a **demo**. It is not intended for processing real financial transactions.")
-
 st.title("🏢 SP Enterprise | Lending Management Dashboard")
-st.caption("*(Educational Demo Version)*")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment", "🛠️ Admin System"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment", "🛠️ Manage & Admin"])
 
+# --- TAB 1: ACTIVE LOANS ---
 with tab1:
     st.subheader("Current Active Loans")
     active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
     
     if not active_loans.empty:
+        # Calculate Next EMI Date dynamically (Finds the next upcoming month from the start date)
+        def calc_next_emi(start_dt):
+            next_date = pd.to_datetime(start_dt)
+            while next_date.date() <= date.today():
+                next_date += pd.DateOffset(months=1)
+            return next_date.date()
+
+        active_loans['Next EMI Date'] = active_loans['start_date'].apply(calc_next_emi)
         active_loans['Current EMI'] = active_loans['remaining_principal'] * (active_loans['monthly_roi'] / 100)
         
         total_remaining = active_loans['remaining_principal'].sum()
@@ -155,12 +151,13 @@ with tab1:
         col1.metric("Total Outstanding Principal Lent", f"₹ {total_remaining:,.2f}")
         col2.metric("Expected Monthly Interest Yield", f"₹ {total_monthly_interest:,.2f}")
         
-        display_df = active_loans[['id', 'customer_name', 'original_principal', 'remaining_principal', 'monthly_roi', 'Current EMI', 'start_date']]
-        display_df.columns = ['Loan ID', 'Customer Name', 'Original (₹)', 'Remaining (₹)', 'ROI (%)', 'Next EMI (₹)', 'Start Date']
+        display_df = active_loans[['id', 'customer_name', 'original_principal', 'remaining_principal', 'monthly_roi', 'Current EMI', 'start_date', 'Next EMI Date']]
+        display_df.columns = ['Loan ID', 'Customer Name', 'Original (₹)', 'Remaining (₹)', 'ROI (%)', 'Next EMI (₹)', 'Start Date', 'Next EMI Date']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
         st.info("No active loans found.")
 
+# --- TAB 2: ISSUE LOAN ---
 with tab2:
     st.subheader("Add New Customer Loan")
     with st.form("new_loan_form", clear_on_submit=True):
@@ -169,7 +166,7 @@ with tab2:
         roi = st.number_input("Monthly ROI (%)", min_value=0.0, step=0.1)
         start_dt = st.date_input("Loan Start Date", date.today())
         
-        submitted = st.form_submit_button("Issue Loan")
+        submitted = st.form_submit_button("Submit New Loan", type="primary")
         if submitted and name and principal > 0:
             execute_query(
                 """INSERT INTO loans 
@@ -177,9 +174,10 @@ with tab2:
                    VALUES (%s, %s, %s, %s, %s, 'Active')""",
                 (name, principal, principal, roi, start_dt)
             )
-            st.success(f"Loan issued to {name}.")
+            st.success(f"Loan issued successfully to {name}.")
             st.rerun()
 
+# --- TAB 3: RECORD PAYMENT ---
 with tab3:
     st.subheader("Log Collections & Principal Returns")
     active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
@@ -196,9 +194,9 @@ with tab3:
         with st.form("payment_form", clear_on_submit=True):
             payment_type = st.radio("Payment Type", ["Interest Payment", "Partial / Full Principal Return"])
             amount = st.number_input("Amount Received (₹)", min_value=0.0, step=500.0)
-            pay_date = st.date_input("Payment Date", date.today())
+            pay_date = st.date_input("Date of Record", date.today())
             
-            submitted = st.form_submit_button("Record Transaction")
+            submitted = st.form_submit_button("Payment Received", type="primary")
             
             if submitted and amount > 0:
                 if payment_type == "Interest Payment":
@@ -235,10 +233,53 @@ with tab3:
     else:
         st.info("No active loans available to receive payments.")
 
+# --- TAB 4: MANAGE & ADMIN ---
 with tab4:
+    st.subheader("Edit or Delete Existing Loans")
+    active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
+    
+    if not active_loans.empty:
+        manage_options = active_loans.apply(
+            lambda x: f"ID: {x['id']} | {x['customer_name']}", axis=1
+        ).tolist()
+        
+        selected_manage_str = st.selectbox("Select Loan to Modify", manage_options, key="manage_select")
+        manage_loan_id = int(selected_manage_str.split(" | ")[0].replace("ID: ", ""))
+        
+        loan_detail = active_loans[active_loans['id'] == manage_loan_id].iloc[0]
+        
+        with st.form("edit_loan_form"):
+            st.write("**Edit Loan Details**")
+            edit_name = st.text_input("Customer Name", value=loan_detail['customer_name'])
+            edit_roi = st.number_input("Monthly ROI (%)", min_value=0.0, step=0.1, value=float(loan_detail['monthly_roi']))
+            edit_remaining = st.number_input("Remaining Principal (₹)", min_value=0.0, step=500.0, value=float(loan_detail['remaining_principal']))
+            
+            update_submitted = st.form_submit_button("Update Loan Record")
+            
+            if update_submitted:
+                execute_query("UPDATE loans SET customer_name=%s, monthly_roi=%s, remaining_principal=%s WHERE id=%s", 
+                              (edit_name, edit_roi, edit_remaining, manage_loan_id))
+                st.success("Loan updated successfully!")
+                st.rerun()
+        
+        st.write("**Delete Loan**")
+        if st.button("Delete Loan Permanently", type="primary"):
+            execute_query("DELETE FROM payments WHERE loan_id = %s", (manage_loan_id,))
+            execute_query("DELETE FROM loans WHERE id = %s", (manage_loan_id,))
+            st.success("Loan and all associated payments have been deleted.")
+            st.rerun()
+    else:
+        st.info("No active loans available to manage.")
+        
+    st.divider()
     st.subheader("System Administration")
     st.info("Use this tool to migrate existing records from your local SQLite database to the Supabase Cloud. This only needs to be done once.")
-    
-    if st.button("Migrate Local Data to Cloud", type="primary"):
+    if st.button("Migrate Local Data to Cloud"):
         with st.spinner("Migrating data to Supabase..."):
             migrate_local_to_cloud()
+
+# ==========================================
+# FOOTER DISCLAIMER
+# ==========================================
+st.divider()
+st.warning("⚠️ **Disclaimer**\n\nThis application is for **educational purposes** only and serves as a **demo**. It is not intended for processing real financial transactions.")

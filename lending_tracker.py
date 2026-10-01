@@ -1,76 +1,91 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import date
+import psycopg2
 
 # ==========================================
 # DATABASE INITIALIZATION
 # ==========================================
-DB_FILE = "lending_firm_v2.db"  # Renamed to handle the new schema safely
+# Fetches the database URL from Streamlit's secure secrets
+DB_URL = st.secrets["DATABASE_URL"]
+
+def get_connection():
+    return psycopg2.connect(DB_URL)
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     c = conn.cursor()
-    # Create Loans table with remaining_principal
     c.execute('''CREATE TABLE IF NOT EXISTS loans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     customer_name TEXT,
-                    original_principal REAL,
-                    remaining_principal REAL,
-                    monthly_roi REAL,
-                    start_date TEXT,
+                    original_principal NUMERIC,
+                    remaining_principal NUMERIC,
+                    monthly_roi NUMERIC,
+                    start_date DATE,
                     status TEXT
                 )''')
-    # Create Payments table
     c.execute('''CREATE TABLE IF NOT EXISTS payments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     loan_id INTEGER,
-                    payment_date TEXT,
-                    amount REAL,
+                    payment_date DATE,
+                    amount NUMERIC,
                     payment_type TEXT
                 )''')
     conn.commit()
     conn.close()
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
 def execute_query(query, params=()):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     c = conn.cursor()
     c.execute(query, params)
     conn.commit()
     conn.close()
 
 def fetch_data(query, params=()):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return df
 
 # ==========================================
-# STREAMLIT UI APP
+# STREAMLIT UI APP & AUTHENTICATION
 # ==========================================
-st.set_page_config(page_title="Lending Firm Tracker", layout="wide")
+st.set_page_config(page_title="SP Enterprise - Lending System", page_icon="🏢", layout="wide")
+
+# 1. Initialize authentication state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+# 2. Function to verify PIN
+def check_pin():
+    if st.session_state.pin_input == "223568":
+        st.session_state.authenticated = True
+    else:
+        st.error("Incorrect PIN. Access Denied.")
+
+# 3. Show SP Enterprise PIN screen if not authenticated
+if not st.session_state.authenticated:
+    st.title("🏢 SP Enterprise")
+    st.subheader("Secure Lending Management System")
+    st.text_input("Enter your 6-digit PIN to access the dashboard", type="password", key="pin_input", on_change=check_pin)
+    st.stop()  # Hides the rest of the app until authenticated
+
+# ==========================================
+# MAIN DASHBOARD (Only visible if PIN is correct)
+# ==========================================
 init_db()
 
-st.title("💼 Lending Firm Tracker (Dynamic EMI)")
+st.title("🏢 SP Enterprise | Lending Management Dashboard")
 
-# Navigation Tabs
 tab1, tab2, tab3 = st.tabs(["📊 Active Loans Dashboard", "➕ Issue New Loan", "💰 Record Payment"])
 
-# ------------------------------------------
-# TAB 1: DASHBOARD
-# ------------------------------------------
 with tab1:
     st.subheader("Current Active Loans")
     active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
     
     if not active_loans.empty:
-        # Calculate expected monthly interest based on REMAINING principal
         active_loans['Current EMI'] = active_loans['remaining_principal'] * (active_loans['monthly_roi'] / 100)
         
-        # Metrics
         total_remaining = active_loans['remaining_principal'].sum()
         total_monthly_interest = active_loans['Current EMI'].sum()
         
@@ -78,22 +93,18 @@ with tab1:
         col1.metric("Total Outstanding Principal Lent", f"₹ {total_remaining:,.2f}")
         col2.metric("Expected Monthly Interest Yield", f"₹ {total_monthly_interest:,.2f}")
         
-        # Formatted Display
         display_df = active_loans[['id', 'customer_name', 'original_principal', 'remaining_principal', 'monthly_roi', 'Current EMI', 'start_date']]
-        display_df.columns = ['Loan ID', 'Customer Name', 'Original (₹)', 'Remaining Principal (₹)', 'ROI (%)', 'Next EMI (₹)', 'Start Date']
+        display_df.columns = ['Loan ID', 'Customer Name', 'Original (₹)', 'Remaining (₹)', 'ROI (%)', 'Next EMI (₹)', 'Start Date']
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
-        st.info("No active loans found. Issue a new loan to get started.")
+        st.info("No active loans found.")
 
-# ------------------------------------------
-# TAB 2: ISSUE NEW LOAN
-# ------------------------------------------
 with tab2:
     st.subheader("Add New Customer Loan")
     with st.form("new_loan_form", clear_on_submit=True):
         name = st.text_input("Customer Name")
         principal = st.number_input("Principal Amount (₹)", min_value=0.0, step=1000.0)
-        roi = st.number_input("Monthly ROI (%)", min_value=0.0, step=0.1, help="e.g., 5 for 5%")
+        roi = st.number_input("Monthly ROI (%)", min_value=0.0, step=0.1)
         start_dt = st.date_input("Loan Start Date", date.today())
         
         submitted = st.form_submit_button("Issue Loan")
@@ -101,29 +112,24 @@ with tab2:
             execute_query(
                 """INSERT INTO loans 
                    (customer_name, original_principal, remaining_principal, monthly_roi, start_date, status) 
-                   VALUES (?, ?, ?, ?, ?, 'Active')""",
+                   VALUES (%s, %s, %s, %s, %s, 'Active')""",
                 (name, principal, principal, roi, start_dt)
             )
-            st.success(f"Loan issued to {name}. Next EMI will be ₹{(principal * (roi/100)):,.2f}.")
+            st.success(f"Loan issued to {name}.")
             st.rerun()
 
-# ------------------------------------------
-# TAB 3: RECORD PAYMENT
-# ------------------------------------------
 with tab3:
     st.subheader("Log Collections & Principal Returns")
     active_loans = fetch_data("SELECT * FROM loans WHERE status = 'Active'")
     
     if not active_loans.empty:
-        # Create dropdown options showing current remaining principal and current EMI
         loan_options = active_loans.apply(
-            lambda x: f"ID: {x['id']} | {x['customer_name']} | Remaining: ₹{x['remaining_principal']} | EMI: ₹{x['remaining_principal']*(x['monthly_roi']/100)}", 
-            axis=1
+            lambda x: f"ID: {x['id']} | {x['customer_name']} | Remaining: ₹{x['remaining_principal']}", axis=1
         ).tolist()
         
         selected_loan_str = st.selectbox("Select Active Loan", loan_options)
         selected_loan_id = int(selected_loan_str.split(" | ")[0].replace("ID: ", ""))
-        current_remaining = float(selected_loan_str.split("Remaining: ₹")[1].split(" |")[0])
+        current_remaining = float(selected_loan_str.split("Remaining: ₹")[1])
         
         with st.form("payment_form", clear_on_submit=True):
             payment_type = st.radio("Payment Type", ["Interest Payment", "Partial / Full Principal Return"])
@@ -135,31 +141,24 @@ with tab3:
             if submitted and amount > 0:
                 if payment_type == "Interest Payment":
                     execute_query(
-                        "INSERT INTO payments (loan_id, payment_date, amount, payment_type) VALUES (?, ?, ?, 'Interest')",
+                        "INSERT INTO payments (loan_id, payment_date, amount, payment_type) VALUES (%s, %s, %s, 'Interest')",
                         (selected_loan_id, pay_date, amount)
                     )
-                    st.success(f"Recorded interest payment of ₹{amount:,.2f}.")
+                    st.success("Interest payment recorded.")
                 else:
-                    # Logic for Principal Return (Partial or Full)
                     execute_query(
-                        "INSERT INTO payments (loan_id, payment_date, amount, payment_type) VALUES (?, ?, ?, 'Principal')",
+                        "INSERT INTO payments (loan_id, payment_date, amount, payment_type) VALUES (%s, %s, %s, 'Principal')",
                         (selected_loan_id, pay_date, amount)
                     )
-                    
                     new_principal = current_remaining - amount
-                    
                     if new_principal <= 0:
-                        # Loan is fully paid off
-                        execute_query("UPDATE loans SET remaining_principal = 0, status = 'Closed' WHERE id = ?", (selected_loan_id,))
-                        st.success(f"Recorded ₹{amount:,.2f}. Full principal returned. Loan is now Closed.")
+                        execute_query("UPDATE loans SET remaining_principal = 0, status = 'Closed' WHERE id = %s", (selected_loan_id,))
+                        st.success("Full principal returned. Loan Closed.")
                     else:
-                        # Partial return: update remaining principal
-                        execute_query("UPDATE loans SET remaining_principal = ? WHERE id = ?", (new_principal, selected_loan_id))
-                        st.success(f"Recorded partial principal return of ₹{amount:,.2f}. Remaining principal is now ₹{new_principal:,.2f}. Next EMI will drop accordingly.")
-                        
+                        execute_query("UPDATE loans SET remaining_principal = %s WHERE id = %s", (new_principal, selected_loan_id))
+                        st.success("Partial principal returned.")
                 st.rerun()
                 
-        # Show payment history
         st.divider()
         st.subheader("Recent Transaction History")
         history = fetch_data("""
